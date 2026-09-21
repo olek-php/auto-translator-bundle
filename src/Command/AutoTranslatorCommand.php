@@ -1,9 +1,8 @@
 <?php
 
-namespace TaxiAdmin\Bundle\AutoTranslatorBundle\Command;
+namespace Olek\Bundle\AutoTranslatorBundle\Command;
 
-use DOMDocument;
-use DOMXPath;
+use RuntimeException;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
@@ -13,52 +12,21 @@ use Symfony\Component\Translation\MessageCatalogue;
 use Symfony\Component\Translation\Reader\TranslationReaderInterface;
 use Symfony\Component\Translation\Writer\TranslationWriterInterface;
 use Symfony\Contracts\HttpClient\HttpClientInterface;
-use Throwable;
 
 class AutoTranslatorCommand extends Command
 {
-
-    /**
-     * @var TranslationReaderInterface
-     */
-    private $reader;
-    /**
-     * @var TranslationWriterInterface
-     */
-    private $writer;
-    /**
-     * @var HttpClientInterface
-     */
-    private $httpClient;
-    /**
-     * @var string
-     */
-    private $defaultLocale;
-    /**
-     * @var array
-     */
-    private $enabledLocales;
-    /**
-     * @var string
-     */
-    private $path;
-
     public function __construct(
-        TranslationReaderInterface $reader,
-        TranslationWriterInterface $writer,
-        HttpClientInterface $httpClient,
-        string $defaultLocale,
-        array $enabledLocales,
-        string $path
+        private TranslationReaderInterface $reader,
+        private TranslationWriterInterface $writer,
+        private HttpClientInterface $httpClient,
+        private string $defaultLocale,
+        private array $enabledLocales,
+        private string $path,
+        private string $apiKey,
+        private string $model,
+        private string $prompt
     )
     {
-        $this->reader = $reader;
-        $this->writer = $writer;
-        $this->httpClient = $httpClient;
-        $this->defaultLocale = $defaultLocale;
-        $this->enabledLocales = $enabledLocales;
-        $this->path = $path;
-
         parent::__construct();
     }
 
@@ -73,6 +41,12 @@ class AutoTranslatorCommand extends Command
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
         $io = new SymfonyStyle($input, $output);
+
+        if (trim($this->apiKey) === '') {
+            $io->error('Configure auto_translator.api_key before running translations.');
+
+            return Command::FAILURE;
+        }
 
         $format = $input->getOption('format');
         $xliffVersion = '1.2';
@@ -91,34 +65,42 @@ class AutoTranslatorCommand extends Command
         $defaultCatalogue = new MessageCatalogue($this->defaultLocale);
         $this->reader->read($this->path, $defaultCatalogue);
 
-        foreach ($this->enabledLocales as $locale) {
+        $catalogues = [];
+        foreach (array_unique($this->enabledLocales) as $locale) {
             if ($locale === $this->defaultLocale) {
                 continue;
             }
-            $catalogue = new MessageCatalogue($locale);
-            $this->reader->read($this->path, $catalogue);
+            $catalogues[$locale] = new MessageCatalogue($locale);
+            $this->reader->read($this->path, $catalogues[$locale]);
+        }
 
-            $qtyNotDefines = 0;
-            foreach ($defaultCatalogue->all() as $domain => $messages) {
-                $notDefines = [];
-                foreach ($messages as $key => $value) {
-                    if ($catalogue->defines($key, $domain) === false ||
+        foreach ($defaultCatalogue->all() as $domain => $messages) {
+            $batch = [];
+            foreach ($messages as $key => $value) {
+                $locales = [];
+                foreach ($catalogues as $locale => $catalogue) {
+                    if (!$catalogue->defines($key, $domain) ||
                         $catalogue->get($key, $domain) === $value ||
                         $catalogue->get($key, $domain) === "__$value"
                     ) {
-                        $notDefines[$key] = $value;
-                        $qtyNotDefines++;
-                        if ($qtyNotDefines === 100) {
-                            $this->translation($catalogue, $notDefines, $domain);
-                            $qtyNotDefines = 0;
-                        }
+                        $locales[] = $locale;
                     }
                 }
-                if ($qtyNotDefines > 0) {
-                    $this->translation($catalogue, $notDefines, $domain);
+                if ($locales === []) {
+                    continue;
+                }
+                $batch[] = ['key' => $key, 'text' => $value, 'target_locales' => $locales];
+                if (count($batch) === 100) {
+                    $this->translation($catalogues, $batch, $domain);
+                    $batch = [];
                 }
             }
+            if ($batch !== []) {
+                $this->translation($catalogues, $batch, $domain);
+            }
+        }
 
+        foreach ($catalogues as $catalogue) {
             foreach ($catalogue->all() as $domain => $messages) {
                 foreach ($messages as $key => $value) {
                     if ($defaultCatalogue->defines($key, $domain) === false) {
@@ -137,81 +119,119 @@ class AutoTranslatorCommand extends Command
         return 0;
     }
 
-    private function getGoogleTranslation(string $message, string $locale): string
+    private function getOpenAITranslations(array $messages): array
     {
-        $rr = [];
-        $rrIndex = 0;
-        $query = preg_replace_callback("/{{[\s\w]+}}/", static function ($matches) use (&$rr, &$rrIndex) {
-            $result = "{{{$rrIndex}}}";
-            $rrIndex++;
-            $rr[$result] = $matches[0];
-            return $result;
-        }, $message);
-
-        $url = "https://translate.google.com/m";
-        $options = [
-            "query" => [
-                "sl"    => $this->defaultLocale,
-                "tl"    => $locale,
-                "hl"    => $this->defaultLocale,
-                "q"     => $query,
-            ]
-        ];
-        try {
-            $response = $this->httpClient->request("GET", $url, $options);
-            $html = $response->getContent();
-        } catch (Throwable $e) {
-            return $message;
-        }
-
-
-        $dom = new DOMDocument('1.0', 'UTF-8');
-        $dom->loadHTML('<?xml encoding="utf-8" ?>' . $html, LIBXML_NOERROR);
-
-        $xpath = new DOMXpath($dom);
-        $result = $this->parseToArray($xpath);
-        if (empty($result)) {
-            return $message;
-        }
-        $translateRaw = urldecode($result[0]);
-        if (empty($rr)) {
-            return $translateRaw;
-        }
-
-        return str_replace(array_keys($rr), array_values($rr), $translateRaw);
-    }
-
-    private function parseToArray($xpath): array
-    {
-        $query = "//div[@class='result-container']";
-        $elements = $xpath->query($query);
-
-        $result = [];
-        foreach ($elements as $element) {
-            $nodes = $element->childNodes;
-            foreach ($nodes as $node) {
-                $result[] = $node->nodeValue;
+        $inputs = [];
+        $localeSchemas = [];
+        foreach ($messages as $index => $message) {
+            $id = 'message_'.$index;
+            $inputs[] = ['id' => $id, 'text' => $message['text'], 'target_locales' => $message['target_locales']];
+            foreach ($message['target_locales'] as $locale) {
+                $localeSchemas[$locale] ??= [
+                    'type' => 'object',
+                    'properties' => [],
+                    'required' => [],
+                    'additionalProperties' => false,
+                ];
+                $localeSchemas[$locale]['properties'][$id] = ['type' => 'string'];
+                $localeSchemas[$locale]['required'][] = $id;
             }
         }
-        return $result;
-    }
-
-    private function translation(MessageCatalogue $catalogue, array $inputs, string $domain): void
-    {
-        $string = implode("\r\n", array_values($inputs));
-        $translationString = $this->getGoogleTranslation($string, $catalogue->getLocale());
-        $translations = explode("\r\n", $translationString);
-
-        if (count($inputs) !== count($translations)) {
-            foreach ($inputs as $key => $value) {
-                $translation = $this->getGoogleTranslation($value, $catalogue->getLocale());
-                $catalogue->set($key, $translation, $domain);
+        $targetLocales = array_keys($localeSchemas);
+        foreach ($inputs as &$message) {
+            if (array_diff($targetLocales, $message['target_locales']) === []) {
+                unset($message['target_locales']);
             }
-            return;
+        }
+        unset($message);
+        $locales = implode(', ', $targetLocales);
+
+        $response = $this->httpClient->request('POST', 'https://api.openai.com/v1/responses', [
+            'auth_bearer' => $this->apiKey,
+            'json' => [
+                'model' => $this->model,
+                'store' => false,
+                'instructions' => strtr($this->prompt, [
+                    '{source_locale}' => $this->defaultLocale,
+                    '{target_locales}' => $locales,
+                    '{target_locale}' => $locales,
+                ])."\nВерни JSON-объект с полем translations: ключи первого уровня — коды локалей, второго — исходные id сообщений. Переводи сообщения из массива messages на все языки общего поля target_locales. Если у сообщения есть собственное поле target_locales, оно полностью заменяет общий список для этого сообщения.",
+                'input' => json_encode([
+                    'target_locales' => $targetLocales,
+                    'messages' => $inputs,
+                ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE),
+                'text' => [
+                    'format' => [
+                        'type' => 'json_schema',
+                        'name' => 'translations',
+                        'strict' => true,
+                        'schema' => [
+                            'type' => 'object',
+                            'properties' => [
+                                'translations' => [
+                                    'type' => 'object',
+                                    'properties' => $localeSchemas,
+                                    'required' => array_keys($localeSchemas),
+                                    'additionalProperties' => false,
+                                ],
+                            ],
+                            'required' => ['translations'],
+                            'additionalProperties' => false,
+                        ],
+                    ],
+                ],
+            ],
+        ])->toArray();
+
+        if (($response['status'] ?? null) !== 'completed') {
+            throw new RuntimeException('OpenAI did not complete the translation for locales '.$locales.'.');
         }
 
-        foreach (array_keys($inputs) as $i => $key) {
-            $catalogue->set($key, $translations[$i], $domain);
+        $text = "";
+        foreach ($response['output'] ?? [] as $item) {
+            if (($item['type'] ?? null) !== 'message') {
+                continue;
+            }
+            foreach ($item['content'] ?? [] as $content) {
+                if (($content['type'] ?? null) === 'refusal') {
+                    throw new RuntimeException('OpenAI refused the translation for locales '.$locales.'.');
+                }
+                if (($content['type'] ?? null) === 'output_text') {
+                    $text .= $content['text'];
+                }
+            }
+        }
+
+        $translations = json_decode($text, true, 512, JSON_THROW_ON_ERROR)['translations'] ?? null;
+        if (!is_array($translations) || count($translations) !== count($localeSchemas)) {
+            throw new RuntimeException('OpenAI returned an unexpected set of translation locales.');
+        }
+        foreach ($localeSchemas as $locale => $schema) {
+            $values = $translations[$locale] ?? null;
+            if (!is_array($values) || count($values) !== count($schema['required'])) {
+                throw new RuntimeException('OpenAI returned an unexpected number of translations for locale '.$locale.'.');
+            }
+        }
+        foreach ($inputs as $message) {
+            foreach ($message['target_locales'] ?? $targetLocales as $locale) {
+                $translation = $translations[$locale][$message['id']] ?? null;
+                if (!is_string($translation) || (trim($translation) === '' && trim($message['text']) !== '')) {
+                    throw new RuntimeException('OpenAI returned an invalid translation for locale '.$locale.'.');
+                }
+            }
+        }
+
+        return $translations;
+    }
+
+    private function translation(array $catalogues, array $inputs, string $domain): void
+    {
+        $translations = $this->getOpenAITranslations($inputs);
+
+        foreach ($inputs as $index => $message) {
+            foreach ($message['target_locales'] as $locale) {
+                $catalogues[$locale]->set($message['key'], $translations[$locale]['message_'.$index], $domain);
+            }
         }
     }
 }
