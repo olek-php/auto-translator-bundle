@@ -24,7 +24,10 @@ class AutoTranslatorCommand extends Command
         private string $path,
         private string $apiKey,
         private string $model,
-        private string $prompt
+        private string $prompt,
+        private float $timeout = 300.0,
+        private int $batchSize = 100,
+        private ?string $reasoningEffort = null
     )
     {
         parent::__construct();
@@ -80,7 +83,6 @@ class AutoTranslatorCommand extends Command
                 $locales = [];
                 foreach ($catalogues as $locale => $catalogue) {
                     if (!$catalogue->defines($key, $domain) ||
-                        $catalogue->get($key, $domain) === $value ||
                         $catalogue->get($key, $domain) === "__$value"
                     ) {
                         $locales[] = $locale;
@@ -90,7 +92,7 @@ class AutoTranslatorCommand extends Command
                     continue;
                 }
                 $batch[] = ['key' => $key, 'text' => $value, 'target_locales' => $locales];
-                if (count($batch) === 100) {
+                if (count($batch) === $this->batchSize) {
                     $this->translation($catalogues, $batch, $domain);
                     $batch = [];
                 }
@@ -121,68 +123,71 @@ class AutoTranslatorCommand extends Command
 
     private function getOpenAITranslations(array $messages): array
     {
-        $inputs = [];
-        $localeSchemas = [];
-        foreach ($messages as $index => $message) {
-            $id = 'message_'.$index;
-            $inputs[] = ['id' => $id, 'text' => $message['text'], 'target_locales' => $message['target_locales']];
+        $inputs = array_column($messages, 'text');
+        $targetLocales = [];
+        foreach ($messages as $message) {
             foreach ($message['target_locales'] as $locale) {
-                $localeSchemas[$locale] ??= [
-                    'type' => 'object',
-                    'properties' => [],
-                    'required' => [],
-                    'additionalProperties' => false,
-                ];
-                $localeSchemas[$locale]['properties'][$id] = ['type' => 'string'];
-                $localeSchemas[$locale]['required'][] = $id;
+                if (!in_array($locale, $targetLocales, true)) {
+                    $targetLocales[] = $locale;
+                }
             }
         }
-        $targetLocales = array_keys($localeSchemas);
-        foreach ($inputs as &$message) {
-            if (array_diff($targetLocales, $message['target_locales']) === []) {
-                unset($message['target_locales']);
-            }
-        }
-        unset($message);
         $locales = implode(', ', $targetLocales);
 
-        $response = $this->httpClient->request('POST', 'https://api.openai.com/v1/responses', [
-            'auth_bearer' => $this->apiKey,
-            'json' => [
-                'model' => $this->model,
-                'store' => false,
-                'instructions' => strtr($this->prompt, [
+        $data = [
+            'model' => $this->model,
+            'store' => false,
+            'instructions' => strtr($this->prompt, [
                     '{source_locale}' => $this->defaultLocale,
                     '{target_locales}' => $locales,
                     '{target_locale}' => $locales,
-                ])."\nВерни JSON-объект с полем translations: ключи первого уровня — коды локалей, второго — исходные id сообщений. Переводи сообщения из массива messages на все языки общего поля target_locales. Если у сообщения есть собственное поле target_locales, оно полностью заменяет общий список для этого сообщения.",
-                'input' => json_encode([
-                    'target_locales' => $targetLocales,
-                    'messages' => $inputs,
-                ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE),
-                'text' => [
-                    'format' => [
-                        'type' => 'json_schema',
-                        'name' => 'translations',
-                        'strict' => true,
-                        'schema' => [
-                            'type' => 'object',
-                            'properties' => [
-                                'translations' => [
-                                    'type' => 'object',
-                                    'properties' => $localeSchemas,
-                                    'required' => array_keys($localeSchemas),
-                                    'additionalProperties' => false,
+                ])."\nОбязательный формат ответа: translations[i][j] — перевод строки messages[j] на язык target_locales[i]. Внешний массив содержит ровно ".count($targetLocales)." элементов, каждый внутренний — ровно ".count($inputs)." строк. Сохраняй порядок обоих входных массивов. Эти требования к формату заменяют любые другие указания о структуре ответа.",
+            'input' => json_encode([
+                'target_locales' => $targetLocales,
+                'messages' => $inputs,
+            ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE),
+            'text' => [
+                'format' => [
+                    'type' => 'json_schema',
+                    'name' => 'translations',
+                    'strict' => true,
+                    'schema' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'translations' => [
+                                'type' => 'array',
+                                'minItems' => count($targetLocales),
+                                'maxItems' => count($targetLocales),
+                                'items' => [
+                                    'type' => 'array',
+                                    'minItems' => count($inputs),
+                                    'maxItems' => count($inputs),
+                                    'items' => ['type' => 'string'],
                                 ],
                             ],
-                            'required' => ['translations'],
-                            'additionalProperties' => false,
                         ],
+                        'required' => ['translations'],
+                        'additionalProperties' => false,
                     ],
                 ],
             ],
-        ])->toArray();
+        ];
 
+        $effort = $this->reasoningEffort;
+        if ($effort === null && ($this->model === 'gpt-5-nano' || str_starts_with($this->model, 'gpt-5-nano-'))) {
+            $effort = 'minimal';
+        }
+        if ($effort !== null) {
+            $data['reasoning'] = ['effort' => $effort];
+        }
+
+        $options = [
+            'auth_bearer' => $this->apiKey,
+            'timeout' => $this->timeout,
+            'json' => $data,
+        ];
+
+        $response = $this->httpClient->request('POST', 'https://api.openai.com/v1/responses', $options)->toArray();
         if (($response['status'] ?? null) !== 'completed') {
             throw new RuntimeException('OpenAI did not complete the translation for locales '.$locales.'.');
         }
@@ -202,23 +207,29 @@ class AutoTranslatorCommand extends Command
             }
         }
 
-        $translations = json_decode($text, true, 512, JSON_THROW_ON_ERROR)['translations'] ?? null;
-        if (!is_array($translations) || count($translations) !== count($localeSchemas)) {
-            throw new RuntimeException('OpenAI returned an unexpected set of translation locales.');
+        $matrix = json_decode($text, true, 512, JSON_THROW_ON_ERROR)['translations'] ?? null;
+        if (!is_array($matrix) || !array_is_list($matrix)) {
+            throw new RuntimeException('OpenAI returned an invalid translations structure: expected a list of '.count($targetLocales).' locale rows, received '.(is_array($matrix) ? 'an object' : get_debug_type($matrix)).'. Check auto_translator.prompt for outdated output-format instructions.');
         }
-        foreach ($localeSchemas as $locale => $schema) {
-            $values = $translations[$locale] ?? null;
-            if (!is_array($values) || count($values) !== count($schema['required'])) {
-                throw new RuntimeException('OpenAI returned an unexpected number of translations for locale '.$locale.'.');
+        if (count($matrix) !== count($targetLocales)) {
+            throw new RuntimeException('OpenAI returned '.count($matrix).' translation rows; expected '.count($targetLocales).' locales ('.$locales.'), with '.count($inputs).' messages per row. Check auto_translator.prompt for outdated output-format instructions.');
+        }
+        $translations = [];
+        foreach ($targetLocales as $localeIndex => $locale) {
+            $values = $matrix[$localeIndex];
+            if (!is_array($values) || !array_is_list($values)) {
+                throw new RuntimeException('OpenAI returned an invalid translation row for locale '.$locale.'; expected a list of '.count($inputs).' strings.');
             }
-        }
-        foreach ($inputs as $message) {
-            foreach ($message['target_locales'] ?? $targetLocales as $locale) {
-                $translation = $translations[$locale][$message['id']] ?? null;
-                if (!is_string($translation) || (trim($translation) === '' && trim($message['text']) !== '')) {
+            if (count($values) !== count($inputs)) {
+                throw new RuntimeException('OpenAI returned '.count($values).' translations for locale '.$locale.'; expected '.count($inputs).'.');
+            }
+            foreach ($inputs as $index => $source) {
+                $translation = $values[$index];
+                if (!is_string($translation) || (trim($translation) === '' && trim($source) !== '')) {
                     throw new RuntimeException('OpenAI returned an invalid translation for locale '.$locale.'.');
                 }
             }
+            $translations[$locale] = $values;
         }
 
         return $translations;
@@ -230,7 +241,7 @@ class AutoTranslatorCommand extends Command
 
         foreach ($inputs as $index => $message) {
             foreach ($message['target_locales'] as $locale) {
-                $catalogues[$locale]->set($message['key'], $translations[$locale]['message_'.$index], $domain);
+                $catalogues[$locale]->set($message['key'], $translations[$locale][$index], $domain);
             }
         }
     }
