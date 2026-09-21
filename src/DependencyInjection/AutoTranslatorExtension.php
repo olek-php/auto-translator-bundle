@@ -27,6 +27,9 @@ class AutoTranslatorExtension extends Extension
             ->addArgument($config['api_key'])
             ->addArgument($config['model'])
             ->addArgument($config['prompt'])
+            ->addArgument($config['timeout'])
+            ->addArgument($config['batch_size'])
+            ->addArgument($config['reasoning_effort'])
             ->addTag('console.command')
         ;
     }
