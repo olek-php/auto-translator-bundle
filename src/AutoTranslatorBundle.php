@@ -1,6 +1,6 @@
 <?php
 
-namespace TaxiAdmin\Bundle\AutoTranslatorBundle;
+namespace Olek\Bundle\AutoTranslatorBundle;
 
 use Symfony\Component\HttpKernel\Bundle\Bundle;
 
