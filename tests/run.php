@@ -105,13 +105,14 @@ $client = new MockHttpClient(function (string $method, string $url, array $optio
             check(is_string($message) && $message !== 'Promotion', 'Only missing source strings sent without metadata');
             $row[] = strtoupper($locale).': '.$message;
         }
-        $translations[] = $row;
+        $translations[] = ['locale' => $locale, 'values' => $row];
     }
     $schema = $body['text']['format']['schema'];
-    check($schema['properties']['translations'] === [
-        'type' => 'array', 'minItems' => 2, 'maxItems' => 2,
-        'items' => ['type' => 'array', 'minItems' => count($inputs), 'maxItems' => count($inputs), 'items' => ['type' => 'string']],
-    ], 'Constant matrix schema');
+    $rows = $schema['properties']['translations'];
+    check($rows['minItems'] === 2 && $rows['maxItems'] === 2, 'Locale count constrained');
+    check($rows['items']['properties']['locale']['enum'] === ['pl', 'de'], 'Explicit allowed locales');
+    check($rows['items']['properties']['values']['minItems'] === count($inputs), 'Message count constrained');
+    $translations = array_reverse($translations);
     return new MockResponse(json_encode(responseBody($translations), JSON_THROW_ON_ERROR));
 });
 [$status, $catalogues, $error] = runCommand($client);
@@ -148,7 +149,7 @@ $storage = new class implements TranslationReaderInterface, TranslationWriterInt
         $this->saved[$catalogue->getLocale()] = clone $catalogue;
     }
 };
-$promotionClient = new MockHttpClient(new MockResponse(json_encode(responseBody([['Promotion']]), JSON_THROW_ON_ERROR)));
+$promotionClient = new MockHttpClient(new MockResponse(json_encode(responseBody([['locale' => 'fr', 'values' => ['Promotion']]]), JSON_THROW_ON_ERROR)));
 for ($run = 0; $run < 2; ++$run) {
     $tester = new CommandTester(new AutoTranslatorCommand($storage, $storage, $promotionClient, 'en', ['en', 'fr'], '/unused', 'test-key', 'gpt-5-nano', 'Translate'));
     check($tester->execute([]) === 0, 'Source-identical translation run succeeds');
@@ -161,17 +162,17 @@ $compactClient = new MockHttpClient(function (string $method, string $url, array
     check(in_array('Content-Type: application/json', $options['headers'], true), 'JSON content type');
     $body = json_decode($options['body'], true, 512, JSON_THROW_ON_ERROR);
     check(str_starts_with($body['instructions'], strtr($config['prompt'], ['{source_locale}' => 'en', '{target_locales}' => implode(', ', $manyLocales)])), 'Custom instructions preserved');
-    check(str_contains($body['instructions'], 'translations[i][j]') && str_contains($body['instructions'], 'ровно 29 элементов') && str_contains($body['instructions'], 'ровно 2 строк'), 'Mandatory matrix ordering and dimensions');
+    check(str_contains($body['instructions'], '{locale, values}') && str_contains($body['instructions'], 'ровно 2 строк'), 'Mandatory matrix ordering and dimensions');
     $schema = $body['text']['format']['schema'];
     check(!isset($schema['$defs']), 'No per-locale definitions');
     $matrixSchema = $schema['properties']['translations'];
     check($matrixSchema['minItems'] === 29 && $matrixSchema['maxItems'] === 29, 'Exactly 29 locale rows required');
-    check($matrixSchema['items']['minItems'] === 2 && $matrixSchema['items']['maxItems'] === 2, 'Exactly two messages per row required');
+    check($matrixSchema['items']['properties']['values']['minItems'] === 2 && $matrixSchema['items']['properties']['values']['maxItems'] === 2, 'Exactly two messages per row required');
     $payload = json_decode($body['input'], true, 512, JSON_THROW_ON_ERROR);
     check($payload === ['target_locales' => $manyLocales, 'messages' => ['Car history', 'Car #']], 'Compact string input');
-    $translations = array_fill(0, count($manyLocales), ['Car history', 'Car #']);
+    $translations = array_map(fn ($locale) => ['locale' => $locale, 'values' => [$locale.': history', $locale.': number']], array_reverse($manyLocales));
     $compactBytes = strlen(json_encode($schema, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES));
-    check($compactBytes < 250, 'Schema stays below 250 bytes');
+    check($compactBytes < 700, 'Schema stays below 700 bytes');
     echo "Schema for 2 messages / 29 locales: $compactBytes bytes.\n";
     return new MockResponse(json_encode(responseBody($translations), JSON_THROW_ON_ERROR));
 });
@@ -180,11 +181,11 @@ $result = (new ReflectionMethod(AutoTranslatorCommand::class, 'getOpenAITranslat
     ['key' => 'history', 'text' => 'Car history', 'target_locales' => $manyLocales],
     ['key' => 'number', 'text' => 'Car #', 'target_locales' => $manyLocales],
 ]);
-check(count($result) === 29 && $result['fr'][1] === 'Car #', 'Compact request retains translation mapping');
+check(count($result) === 29 && $result['fr'][1] === 'fr: number' && $result['ru'][0] === 'ru: history' && $result['ro'][0] === 'ro: history', 'Compact request retains translation mapping');
 
 foreach ([
     [[array_fill(0, 100, 'ok')], '1 translation rows; expected 2 locales (pl, de), with 100 messages per row'],
-    [[array_fill(0, 99, 'ok'), array_fill(0, 100, 'ok')], '99 translations for locale pl; expected 100'],
+    [[['locale' => 'pl', 'values' => array_fill(0, 99, 'ok')], ['locale' => 'de', 'values' => array_fill(0, 100, 'ok')]], '99 translations for locale pl; expected 100'],
     [['pl' => ['ok']], 'expected a list of 2 locale rows, received an object'],
 ] as [$invalidMatrix, $diagnostic]) {
     [$status, $catalogues, $error] = runCommand(new MockHttpClient(new MockResponse(json_encode(responseBody($invalidMatrix), JSON_THROW_ON_ERROR))));
@@ -196,7 +197,7 @@ foreach ([['gpt-5-nano-2025-08-07', null, 'minimal'], ['gpt-5-nano', 'low', 'low
         $body = json_decode($options['body'], true, 512, JSON_THROW_ON_ERROR);
         check(($body['reasoning']['effort'] ?? null) === $expectedEffort, 'Reasoning effort selection');
         check($expectedEffort !== null || !isset($body['reasoning']), 'Other models retain API defaults');
-        return new MockResponse(json_encode(responseBody([['Promotion']]), JSON_THROW_ON_ERROR));
+        return new MockResponse(json_encode(responseBody([['locale' => 'fr', 'values' => ['Promotion']]]), JSON_THROW_ON_ERROR));
     });
     $command = new AutoTranslatorCommand($storage, $storage, $effortClient, 'en', ['fr'], '/unused', 'test-key', $model, 'Translate', reasoningEffort: $effort);
     (new ReflectionMethod(AutoTranslatorCommand::class, 'getOpenAITranslations'))->invoke($command, [
@@ -212,6 +213,11 @@ check($status !== 0 && $catalogues === [] && $error instanceof Symfony\Contracts
 
 foreach ([
     responseBody(['too few']),
+    responseBody([['locale' => 'pl', 'values' => array_fill(0, 100, 'ok')], ['locale' => 'pl', 'values' => array_fill(0, 100, 'ok')]]),
+    responseBody([['locale' => 'pl', 'values' => array_fill(0, 100, 'ok')], ['locale' => 'ru', 'values' => array_fill(0, 100, 'ok')]]),
+    responseBody([['locale' => 'pl', 'values' => array_fill(0, 100, 'ok')], ['values' => array_fill(0, 100, 'ok')]]),
+    responseBody([['locale' => 'pl', 'values' => array_fill(0, 100, 'ok')], ['locale' => 'de', 'values' => array_fill(0, 100, null)]]),
+    responseBody([['locale' => 'pl', 'values' => array_fill(0, 100, 'ok')], ['locale' => 'de', 'values' => array_fill(0, 100, '')]]),
     responseBody([array_fill(0, 100, 'Only Polish')]),
     responseBody([array_fill(0, 99, 'ok'), array_fill(0, 100, 'ok')]),
     responseBody([array_fill(0, 101, 'ok'), array_fill(0, 100, 'ok')]),
@@ -247,7 +253,7 @@ $client = new MockHttpClient(function (string $method, string $url, array $optio
     $translations = [];
     $payload = json_decode($body['input'], true, 512, JSON_THROW_ON_ERROR);
     foreach ($payload['target_locales'] as $locale) {
-        $translations[] = array_fill(0, count($payload['messages']), 'Translated');
+        $translations[] = ['locale' => $locale, 'values' => array_fill(0, count($payload['messages']), 'Translated')];
     }
     return new MockResponse(json_encode(responseBody($translations), JSON_THROW_ON_ERROR));
 });

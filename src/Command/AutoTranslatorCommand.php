@@ -141,7 +141,7 @@ class AutoTranslatorCommand extends Command
                     '{source_locale}' => $this->defaultLocale,
                     '{target_locales}' => $locales,
                     '{target_locale}' => $locales,
-                ])."\nОбязательный формат ответа: translations[i][j] — перевод строки messages[j] на язык target_locales[i]. Внешний массив содержит ровно ".count($targetLocales)." элементов, каждый внутренний — ровно ".count($inputs)." строк. Сохраняй порядок обоих входных массивов. Эти требования к формату заменяют любые другие указания о структуре ответа.",
+                ])."\nОбязательный формат ответа: translations — массив объектов {locale, values}. locale — точный код из target_locales, values[j] — перевод messages[j] на этот язык. Верни каждый запрошенный язык ровно один раз и ровно ".count($inputs)." строк в values. Сохраняй порядок сообщений. Эти требования к формату заменяют любые другие указания о структуре ответа.",
             'input' => json_encode([
                 'target_locales' => $targetLocales,
                 'messages' => $inputs,
@@ -159,10 +159,18 @@ class AutoTranslatorCommand extends Command
                                 'minItems' => count($targetLocales),
                                 'maxItems' => count($targetLocales),
                                 'items' => [
-                                    'type' => 'array',
-                                    'minItems' => count($inputs),
-                                    'maxItems' => count($inputs),
-                                    'items' => ['type' => 'string'],
+                                    'type' => 'object',
+                                    'properties' => [
+                                        'locale' => ['type' => 'string', 'enum' => $targetLocales],
+                                        'values' => [
+                                            'type' => 'array',
+                                            'minItems' => count($inputs),
+                                            'maxItems' => count($inputs),
+                                            'items' => ['type' => 'string'],
+                                        ],
+                                    ],
+                                    'required' => ['locale', 'values'],
+                                    'additionalProperties' => false,
                                 ],
                             ],
                         ],
@@ -215,8 +223,15 @@ class AutoTranslatorCommand extends Command
             throw new RuntimeException('OpenAI returned '.count($matrix).' translation rows; expected '.count($targetLocales).' locales ('.$locales.'), with '.count($inputs).' messages per row. Check auto_translator.prompt for outdated output-format instructions.');
         }
         $translations = [];
-        foreach ($targetLocales as $localeIndex => $locale) {
-            $values = $matrix[$localeIndex];
+        foreach ($matrix as $row) {
+            if (!is_array($row) || !isset($row['locale']) || !is_string($row['locale']) || !in_array($row['locale'], $targetLocales, true)) {
+                throw new RuntimeException('OpenAI returned a missing or unexpected locale code.');
+            }
+            $locale = $row['locale'];
+            if (array_key_exists($locale, $translations)) {
+                throw new RuntimeException('OpenAI returned duplicate translations for locale '.$locale.'.');
+            }
+            $values = $row['values'] ?? null;
             if (!is_array($values) || !array_is_list($values)) {
                 throw new RuntimeException('OpenAI returned an invalid translation row for locale '.$locale.'; expected a list of '.count($inputs).' strings.');
             }
